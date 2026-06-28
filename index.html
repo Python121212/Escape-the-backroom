@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Simulation Data Analysis</title>
+    <link rel="manifest" href="manifest.json">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <style>
+        * { box-sizing: border-box; user-select: none; -webkit-user-select: none; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; font-family: sans-serif; }
+        
+        /* メイン映像エリア */
+        #remoteVideo { width: 100%; height: 100%; object-fit: contain; z-index: 1; }
+
+        /* 左上：ステータス表示 */
+        #status {
+            position: absolute; top: 15px; left: 15px; padding: 8px 15px;
+            background: rgba(0,0,0,0.75); color: #00ffcc; font-size: 13px; font-weight: bold;
+            border-radius: 6px; z-index: 10; pointer-events: none; border: 1px solid #00ffcc;
+        }
+
+        /* 右上：コントロールパネル（ゲーム画面を邪魔しない透過デザイン） */
+        .control-panel {
+            position: absolute; top: 15px; right: 15px; display: flex; gap: 10px; z-index: 10;
+        }
+        .btn {
+            padding: 8px 15px; background: rgba(20, 20, 20, 0.8); color: #fff; border: 1px solid #555;
+            border-radius: 6px; font-size: 13px; font-weight: bold; cursor: pointer; transition: 0.2s;
+        }
+        .btn-start { border-color: #28a745; color: #2aa144; }
+        .btn-start:active { background: #28a745; color: #fff; }
+        .btn-vc { border-color: #007bff; color: #007bff; }
+        .btn-vc.active { background: #007bff; color: #fff; }
+    </style>
+</head>
+<body>
+
+    <div id="status">System Idle (Ready)</div>
+    
+    <div class="control-panel">
+        <button class="btn btn-start" onclick="triggerServer('START')">SERVER START</button>
+        <button class="btn btn-vc" id="vcBtn" onclick="toggleVoiceChat()">VOICE CHAT: OFF</button>
+        <button class="btn" onclick="triggerServer('STOP')">SHUTDOWN</button>
+    </div>
+
+    <video id="remoteVideo" autoplay playsinline muted></video>
+
+    <script>
+        // --- 設定エリア ---
+        const GAS_URL = "ここにあなたのGASのWebアプリURLを貼り付ける"; 
+
+        if ('serviceWorker' in navigator) { navigator.serviceWorker.register('sw.js'); }
+
+        let pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        let dataChannel = null;
+        let vcInterval = null;
+        let isVoiceChatActive = false;
+
+        // 1. サーバーへの起動・終了コマンド送信
+        async function triggerServer(command) {
+            updateStatus(`Sending ${command} signal...`);
+            try {
+                let res = await fetch(GAS_URL, {
+                    method: "POST",
+                    mode: "no-cors", // GASのCORS制限を突破
+                    body: JSON.stringify({ action: "trigger_server", command: command })
+                });
+                updateStatus(`Signal [${command}] Queued.`);
+                if(command === 'START') {
+                    // 起動命令を出したら、10秒後にWebRTCのOffer送信フェーズへ移行
+                    setTimeout(initiateWebRTC, 10000);
+                }
+            } catch (e) {
+                updateStatus("Signal failed.");
+            }
+        }
+
+        // 2. 超高速WebRTC接続（Offerの生成と送信）
+        async function initiateWebRTC() {
+            updateStatus("Initiating Low-Latency Pipeline...");
+            dataChannel = pc.createDataChannel("inputChannel");
+            
+            dataChannel.onopen = () => { updateStatus("Pipeline Linked (0ms Input Latency)"); };
+
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            // GASへOfferを送信
+            await fetch(GAS_URL, {
+                method: "POST",
+                mode: "no-cors",
+                body: JSON.stringify({ action: "send_offer", offer: offer.sdp })
+            });
+
+            // 3秒ごとにKaggle側からのAnswer（返答）がGASに届いていないかチェック開始
+            let answerCheck = setInterval(async () => {
+                let res = await fetch(GAS_URL, { method: "POST", body: JSON.stringify({ action: "get_answer" }) });
+                let data = await res.json();
+                if (data.status === "CONNECTED" && data.answer) {
+                    clearInterval(answerCheck);
+                    await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: data.answer }));
+                    updateStatus("Stream Connected.");
+                }
+            }, 3000);
+        }
+
+        pc.ontrack = (event) => {
+            document.getElementById('remoteVideo').srcObject = event.streams[0];
+        };
+
+        // 3. 近接ボイスチャット（音声データ）の中継制御
+        async function toggleVoiceChat() {
+            const btn = document.getElementById("vcBtn");
+            if (!isVoiceChatActive) {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    btn.classList.add("active");
+                    btn.innerText = "VOICE CHAT: ON";
+                    isVoiceChatActive = true;
+                    
+                    // スマホのマイク音声を定期的にGASにプッシュ（仮のモック：実際はMediaRecorderで細切れにして送信）
+                    vcInterval = setInterval(() => {
+                        fetch(GAS_URL, {
+                            method: "POST",
+                            mode: "no-cors",
+                            body: JSON.stringify({ action: "push_voice", direction: "up", audio_blob: "base64_audio_data_here" })
+                        });
+                    }, 1000); // 1秒ごとに音声をパッキング
+                } catch (e) {
+                    alert("マイクの許可が必要です");
+                }
+            } else {
+                clearInterval(vcInterval);
+                btn.classList.remove("active");
+                btn.innerText = "VOICE CHAT: OFF";
+                isVoiceChatActive = false;
+            }
+        }
+
+        function updateStatus(msg) { document.getElementById('status').innerText = msg; }
+    </script>
+</body>
+</html>
